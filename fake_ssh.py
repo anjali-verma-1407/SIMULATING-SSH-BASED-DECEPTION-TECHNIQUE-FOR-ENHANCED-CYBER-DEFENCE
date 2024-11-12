@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+"""Fake SSH Server Utilizing Paramiko"""
+import argparse
+import threading
+import socket
+import sys
+import traceback
+import paramiko
+
+LOG = open("logs/log.txt", "a")
+HOST_KEY = paramiko.RSAKey(filename='keys/private.key')
+SSH_BANNER = "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.3"
+
+
+def handle_cmd(cmd, chan):
+    """Branching statements to handle and prepare a response for a command"""
+    response = ""
+    if cmd.startswith("sudo"):
+        send_ascii("sudo.txt", chan)
+        return
+    elif cmd.startswith("ls"):
+        response = "file1.txt	file2.txt	file3.txt	file4.txt	file5.txt"    	    
+    elif cmd.startswith("version"):
+        response = "22.04 LTS (Jammy Jellyfish)"
+    elif cmd.startswith("chmod"):
+        response = "All files can be accessed and executed by you now!"
+    elif cmd.startswith("pwd"):
+        response = "/home/host/Desktop"
+    elif cmd.startswith("cd"):
+        send_ascii("cd.txt", chan)
+        return
+    elif cmd.startswith("cat"):
+        send_ascii("cat.txt", chan)
+        return
+    elif cmd.startswith("netstat"):
+    	send_ascii("netstat.txt", chan)
+        
+    elif cmd.startswith("rm"):
+        send_ascii("bomb.txt", chan)
+        response = "Files permanently removed and cannot be easily recovered"
+    elif cmd.startswith("whoami"):
+        response = "host"
+    elif ".exe" in cmd:
+        response = "Trying to access .exe files from an ssh terminal..... Your methods are unconventional"
+    elif cmd.startswith("cmd"):
+        response = "command not found"
+    elif cmd.startswith("nmap"):
+        response = "Nmap done: 1 IP address (1 host up) scanned in 1.20 seconds"
+    elif cmd == "help":
+        send_ascii("help.txt", chan)
+        return
+    else:
+        send_ascii("clippy.txt", chan)
+        response = "Use the 'help' command to view available commands"
+
+    LOG.write(response + "\n")
+    LOG.flush()
+    chan.send(response + "\r\n")
+
+
+def send_ascii(filename, chan):
+    """Print ascii from a file and send it to the channel"""
+    with open('ascii/{}'.format(filename)) as text:
+        chan.send("\r")
+        for line in enumerate(text):
+            LOG.write(line[1])
+            chan.send(line[1] + "\r")
+    LOG.flush()
+
+
+class FakeSshServer(paramiko.ServerInterface):
+    """Settings for paramiko server interface"""
+    def _init_(self):
+        self.event = threading.Event()
+
+    def check_channel_request(self, kind, chanid):
+        if kind == 'session':
+            return paramiko.OPEN_SUCCEEDED
+        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_auth_password(self, username, password):
+        # Accept all passwords as valid by default
+        return paramiko.AUTH_SUCCESSFUL
+
+    def get_allowed_auths(self, username):
+        return 'password'
+
+    def check_channel_shell_request(self, channel):
+        self.event.set()
+        return True
+
+    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+        return True
+
+
+def handle_connection(client, addr):
+    """Handle a new ssh connection"""
+    LOG.write("\n\nConnection from: " + addr[0] + "\n")
+    print('Got a connection!')
+    try:
+        transport = paramiko.Transport(client)
+        transport.add_server_key(HOST_KEY)
+        # Change banner to appear legit on nmap (or other network) scans
+        transport.local_version = SSH_BANNER
+        server = FakeSshServer()
+        try:
+            transport.start_server(server=server)
+        except paramiko.SSHException:
+            print('*** SSH negotiation failed.')
+            raise Exception("SSH negotiation failed")
+        # wait for auth
+        chan = transport.accept(20)
+        if chan is None:
+            print('*** No channel.')
+            raise Exception("No channel")
+
+        server.event.wait(10)
+        if not server.event.is_set():
+            print('*** Client never asked for a shell.')
+            raise Exception("No shell request")
+
+        try:
+            chan.send("Welcome to the my control server\r\n\r\n")
+            run = True
+            while run:
+                chan.send("$ ")
+                command = ""
+                while not command.endswith("\r"):
+                    transport = chan.recv(1024)
+                    # Echo input to psuedo-simulate a basic terminal
+                    chan.send(transport)
+                    command += transport.decode("utf-8")
+
+                chan.send("\r\n")
+                command = command.rstrip()
+                LOG.write("$ " + command + "\n")
+                print(command)
+                if command == "exit":
+                    run = False
+                else:
+                    handle_cmd(command, chan)
+
+        except Exception as err:
+            print('!!! Exception: {}: {}'.format(err._class_, err))
+            traceback.print_exc()
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+        chan.close()
+
+    except Exception as err:
+        print('!!! Exception: {}: {}'.format(err._class_, err))
+        traceback.print_exc()
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+def start_server(port, bind):
+    """Init and run the ssh server"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind, port))
+    except Exception as err:
+        print('*** Bind failed: {}'.format(err))
+        traceback.print_exc()
+        sys.exit(1)
+
+    threads = []
+    while True:
+        try:
+            sock.listen(100)
+            print('Listening for connection ...')
+            client, addr = sock.accept()
+        except Exception as err:
+            print('*** Listen/accept failed: {}'.format(err))
+            traceback.print_exc()
+        new_thread = threading.Thread(target=handle_connection, args=(client, addr))
+        new_thread.start()
+        threads.append(new_thread)
+
+    for thread in threads:
+        thread.join()
+
+
+if _name_ == "_main_":
+    parser = argparse.ArgumentParser(description='Run a fake ssh server')
+    parser.add_argument("--port", "-p", help="The port to bind the ssh server to (default 22)", default=22, type=int, action="store")
+    parser.add_argument("--bind", "-b", help="The address to bind the ssh server to", default="", type=str, action="store")
+    args = parser.parse_args()
+    start_server(args.port, args.bind)
